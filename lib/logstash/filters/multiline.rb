@@ -5,6 +5,7 @@
 
 require "logstash/filters/base"
 require "logstash/namespace"
+require "set"
 
 # The multiline filter is for combining multiple events from a single source
 # into the same event.
@@ -41,7 +42,7 @@ require "logstash/namespace"
 #     filter {
 #       multiline {
 #         type => "somefiletype"
-#         pattern => "^\\s"
+#         pattern => "^\s"
 #         what => "previous"
 #       }
 #     }
@@ -61,13 +62,13 @@ require "logstash/namespace"
 class LogStash::Filters::Multiline < LogStash::Filters::Base
 
   config_name "multiline"
-  plugin_status "stable"
+  milestone 3
 
   # The regular expression to match
-  config :pattern, :validate => :string, :require => true
+  config :pattern, :validate => :string, :required => true
 
   # If the pattern matched, does event belong to the next or previous event?
-  config :what, :validate => ["previous", "next"], :require => true
+  config :what, :validate => ["previous", "next"], :required => true
 
   # Negate the regexp pattern ('if not matched')
   config :negate, :validate => :boolean, :default => false
@@ -84,11 +85,34 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
   # the new connection as a new stream and break any multiline goodness that
   # may have occurred between the old and new connection. To solve this use
   # case, you can use "%{@source_host}.%{@type}" instead.
-  config :stream_identity , :validate => :string, :default => "%{@source}.%{@type}"
+  config :stream_identity , :validate => :string, :default => "%{host}.%{path}.%{type}"
+  
+  # logstash ships by default with a bunch of patterns, so you don't
+  # necessarily need to define this yourself unless you are adding additional
+  # patterns.
+  #
+  # Pattern files are plain text with format:
+  #
+  #     NAME PATTERN
+  #
+  # For example:
+  #
+  #     NUMBER \d+
+  config :patterns_dir, :validate => :array, :default => []
+
+  # Detect if we are running from a jarfile, pick the right path.
+  @@patterns_path = Set.new
+  if __FILE__ =~ /file:\/.*\.jar!.*/
+    @@patterns_path += ["#{File.dirname(__FILE__)}/../../patterns/*"]
+  else
+    @@patterns_path += ["#{File.dirname(__FILE__)}/../../../patterns/*"]
+  end
 
   public
   def initialize(config = {})
     super
+
+    @threadsafe = false
 
     # This filter needs to keep state.
     @types = Hash.new { |h,k| h[k] = [] }
@@ -97,12 +121,30 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
 
   public
   def register
-    begin
-      @pattern = Regexp.new(@pattern)
-    rescue RegexpError => e
-      @logger.fatal("Invalid pattern for multiline filter",
-                    :pattern => @pattern, :exception => e, :backtrace => e.backtrace)
+    require "grok-pure" # rubygem 'jls-grok'
+
+    @grok = Grok.new
+
+    @patterns_dir = @@patterns_path.to_a + @patterns_dir
+    @patterns_dir.each do |path|
+      # Can't read relative paths from jars, try to normalize away '../'
+      while path =~ /file:\/.*\.jar!.*\/\.\.\//
+        # replace /foo/bar/../baz => /foo/baz
+        path = path.gsub(/[^\/]+\/\.\.\//, "")
+      end
+
+      if File.directory?(path)
+        path = File.join(path, "*")
+      end
+
+      Dir.glob(path).each do |file|
+        @logger.info("Grok loading patterns from file", :path => file)
+        @grok.add_patterns_from_file(file)
+      end
     end
+
+    @grok.compile(@pattern)
+
     @logger.debug("Registered multiline plugin", :type => @type, :config => @config)
   end # def register
 
@@ -110,11 +152,15 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
   def filter(event)
     return unless filter?(event)
 
-    match = @pattern.match(event.message)
+    if event["message"].is_a?(Array)
+      match = @grok.match(event["message"].first)
+    else
+      match = @grok.match(event["message"])
+    end
     key = event.sprintf(@stream_identity)
     pending = @pending[key]
 
-    @logger.debug("Multiline", :pattern => @pattern, :message => event.message,
+    @logger.debug("Multiline", :pattern => @pattern, :message => event["message"],
                   :match => match, :negate => @negate)
 
     # Add negate option
@@ -123,7 +169,7 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
     case @what
     when "previous"
       if match
-        event.tags |= ["multiline"]
+        event.tag "multiline"
         # previous previous line is part of this event.
         # append it to the event and cancel it
         if pending
@@ -147,7 +193,7 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
       end # if/else match
     when "next"
       if match
-        event.tags |= ["multiline"]
+        event.tag "multiline"
         # this line is part of a multiline event, the next
         # line will be part, too, put it into pending.
         if pending
@@ -172,19 +218,21 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
     end # case @what
 
     if !event.cancelled?
-      filter_matched(event)
+      event["message"] = event["message"].join("\n") if event["message"].is_a?(Array)
+      event["@timestamp"] = event["@timestamp"].first if event["@timestamp"].is_a?(Array)
+      filter_matched(event) if match
     end
-    filter_matched(event) if !event.cancelled?
   end # def filter
 
   # Flush any pending messages. This is generally used for unit testing only.
   public
-  def flush(key)
-    if @pending[key]
-      event = @pending[key]
-      @pending.delete(key)
+  def flush
+    events = []
+    @pending.each do |key, value|
+      value.uncancel
+      events << value
     end
-    return event
+    @pending.clear
+    return events
   end # def flush
-
-end # class LogStash::Filters::Date
+end # class LogStash::Filters::Multiline

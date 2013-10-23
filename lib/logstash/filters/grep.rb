@@ -9,7 +9,7 @@ require "logstash/namespace"
 class LogStash::Filters::Grep < LogStash::Filters::Base
 
   config_name "grep"
-  plugin_status "beta"
+  milestone 3
 
   # Drop events that don't match
   #
@@ -25,27 +25,43 @@ class LogStash::Filters::Grep < LogStash::Filters::Base
   # through.
   config :negate, :validate => :boolean, :default => false
 
-  # A hash of matches of field => regexp
-  # Normal regular expressions are supported here.
+  # A hash of matches of field => regexp.  If multiple matches are specified,
+  # all must match for the grep to be considered successful.  Normal regular
+  # expressions are supported here.
+  #
+  # For example:
+  #
+  #     filter {
+  #       grep {
+  #         match => [ "message", "hello world" ]
+  #       }
+  #     }
+  #
+  # The above will drop all events with a message not matching "hello world" as
+  # a regular expression.
   config :match, :validate => :hash, :default => {}
 
-  # Config for grep is:
-  #   fieldname: pattern
-  #   Allow arbitrary keys for this config.
-  config /[A-Za-z0-9_-]+/, :validate => :string
+  # Use case-insensitive matching. Similar to 'grep -i'
+  #
+  # If enabled, ignore case distinctions in the patterns.
+  config :ignore_case, :validate => :boolean, :default => false
 
   public
   def register
-    @patterns = Hash.new { |h,k| h[k] = [] }
-      # TODO(sissel): 
-    @match.merge(@config).each do |field, pattern|
-      # Skip known config names
-      next if (RESERVED + ["negate", "match", "drop"]).include?(field)
+    @logger.warn("The 'grep' plugin is no longer necessary now that you can do if/elsif/else in logstash configs. This plugin will be removed in the future. If you need to drop events, please use the drop filter. If you need to take action based on a match, use an 'if' block and the mutate filter. See the following URL for details on how to use if/elsif/else in your logstash configs:http://logstash.net/docs/#{LOGSTASH_VERSION}/configuration")
 
-      re = Regexp.new(pattern)
-      @patterns[field] << re
-      @logger.debug("Registered grep", :type => @type, :field => field,
-                    :pattern => pattern, :regexp => re)
+    @patterns = Hash.new { |h,k| h[k] = [] }
+
+      # TODO(sissel): 
+    @match.each do |field, pattern|
+
+      pattern = [pattern] if pattern.is_a?(String)
+      pattern.each do |p|
+        re = Regexp.new(p, @ignore_case ? Regexp::IGNORECASE : 0)
+        @patterns[field] << re
+        @logger.debug? and @logger.debug("Registered grep", :type => @type, :field => field,
+                    :pattern => p, :regexp => re)
+      end
     end # @match.merge.each
   end # def register
 
@@ -55,6 +71,22 @@ class LogStash::Filters::Grep < LogStash::Filters::Base
 
     @logger.debug("Running grep filter", :event => event, :config => config)
     matches = 0
+
+    # If negate is set but no patterns are given, drop the event.
+    # This is useful in cases where you want to drop all events with
+    # a given type or set of tags
+    #
+    # filter {
+    #   grep {
+    #     negate => true
+    #     type => blah
+    #   }
+    # }
+    if @negate && @patterns.empty?
+      event.cancel
+      return
+    end
+
     @patterns.each do |field, regexes|
       # For each match object, we have to match everything in order to
       # apply any fields/tags.

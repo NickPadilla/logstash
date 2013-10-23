@@ -2,17 +2,18 @@ require "logstash/outputs/base"
 require "logstash/namespace"
 require "logstash/event"
 
-# Push messages to the juggernaut websockets server
-# https://github.com/maccman/juggernaut  Wraps 
-# Websockets and supports other methods (including xhr longpolling)
-# This is basiccaly, just an extension of the redis output 
-# (Juggernaut pulls messages from redis).  But it pushes messages
-# to a particular channel and formats the messages in the way 
-# juggernaut expects.
-class LogStash::Outputs::Redis < LogStash::Outputs::Base
+# Push messages to the juggernaut websockets server:
+#
+# * https://github.com/maccman/juggernaut
+#
+# Wraps Websockets and supports other methods (including xhr longpolling) This
+# is basically, just an extension of the redis output (Juggernaut pulls
+# messages from redis).  But it pushes messages to a particular channel and
+# formats the messages in the way juggernaut expects.
+class LogStash::Outputs::Juggernaut < LogStash::Outputs::Base
 
   config_name "juggernaut"
-  plugin_status "experimental"
+  milestone 1
 
   # The hostname of the redis server to which juggernaut is listening.
   config :host, :validate => :string, :default => "127.0.0.1"
@@ -30,17 +31,17 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
   config :password, :validate => :password
 
   # List of channels to which to publish. Dynamic names are
-  # valid here, for example "logstash-%{@type}".
+  # valid here, for example "logstash-%{type}".
   config :channels, :validate => :array, :required => true
 
-  # How should be message be formatted before pusing to the websocket.
+  # How should the message be formatted before pushing to the websocket.
   config :message_format, :validate => :string
 
   public
   def register
     require 'redis'
 
-    if not @channels 
+    if not @channels
       raise RuntimeError.new(
         "Must define the channels on which to publish the messages"
       )
@@ -74,15 +75,15 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
     begin
       @redis ||= connect
       if @message_format
-        formatted = event.sprintf(@message_format) 
+        formatted = event.sprintf(@message_format)
       else
         formatted = event.to_json
       end
-      juggernaut_message = { 
-        "channels" => @channels.collect{ |x| event.sprintf(x) }, 
-        "data" => event.message 
+      juggernaut_message = {
+        "channels" => @channels.collect{ |x| event.sprintf(x) },
+        "data" => event["message"]
       }
-      
+
       @redis.publish 'juggernaut', juggernaut_message.to_json
     rescue => e
       @logger.warn("Failed to send event to redis", :event => event,

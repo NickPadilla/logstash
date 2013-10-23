@@ -1,14 +1,21 @@
 require "logstash/inputs/base"
+require "logstash/inputs/threadable"
 require "logstash/namespace"
 
 # Read events from a redis. Supports both redis channels and also redis lists
 # (using BLPOP)
 #
 # For more information about redis, see <http://redis.io/>
-class LogStash::Inputs::Redis < LogStash::Inputs::Base
-
+#
+# ## `batch_count` note
+#
+# If you use the 'batch_count' setting, you *must* use a redis version 2.6.0 or
+# newer. Anything older does not support the operations used by batching.
+class LogStash::Inputs::Redis < LogStash::Inputs::Threadable
   config_name "redis"
-  plugin_status "beta"
+  milestone 2
+
+  default :codec, "json"
 
   # Name is used for logging in case there are multiple instances.
   # This feature has no real function and will be removed in future versions.
@@ -43,12 +50,8 @@ class LogStash::Inputs::Redis < LogStash::Inputs::Base
   # TODO: change required to true
   config :data_type, :validate => [ "list", "channel", "pattern_channel" ], :required => false
 
-  public
-  def initialize(params)
-    super
-
-    @format ||= "json_event"
-  end # def initialize
+  # How many events to return from redis using EVAL
+  config :batch_count, :validate => :number, :default => 1
 
   public
   def register
@@ -87,30 +90,95 @@ class LogStash::Inputs::Redis < LogStash::Inputs::Base
 
   private
   def connect
-    Redis.new(
+    redis = Redis.new(
       :host => @host,
       :port => @port,
       :timeout => @timeout,
       :db => @db,
-      :password => @password
+      :password => @password.nil? ? nil : @password.value
     )
+    load_batch_script(redis) if @data_type == 'list' && (@batch_count > 1)
+    return redis
   end # def connect
+
+  private
+  def load_batch_script(redis)
+    #A redis lua EVAL script to fetch a count of keys
+    #in case count is bigger than current items in queue whole queue will be returned without extra nil values
+    redis_script = <<EOF
+          local i = tonumber(ARGV[1])
+          local res = {}
+          local length = redis.call('llen',KEYS[1])
+          if length < i then i = length end
+          while (i > 0) do
+            local item = redis.call("lpop", KEYS[1])
+            if (not item) then
+              break
+            end
+            table.insert(res, item)
+            i = i-1
+          end
+          return res
+EOF
+    @redis_script_sha = redis.script(:load, redis_script)
+  end
 
   private
   def queue_event(msg, output_queue)
     begin
-      event = to_event msg, identity
-      output_queue << event if event
+      @codec.decode(msg) do |event|
+        decorate(event)
+        output_queue << event
+      end
     rescue => e # parse or event creation error
-      @logger.error("Failed to create event", :message => msg, exception => e,
+      @logger.error("Failed to create event", :message => msg, :exception => e,
                     :backtrace => e.backtrace);
     end
   end
 
   private
   def list_listener(redis, output_queue)
-    response = redis.blpop @key, 0
-    queue_event response[1], output_queue
+
+    # blpop returns the 'key' read from as well as the item result
+    # we only care about the result (2nd item in the list).
+    item = redis.blpop(@key, 0)[1]
+
+    # blpop failed or .. something?
+    # TODO(sissel): handle the error
+    return if item.nil?
+    queue_event(item, output_queue)
+
+    # If @batch_count is 1, there's no need to continue.
+    return if @batch_count == 1
+
+    begin
+      redis.evalsha(@redis_script_sha, [@key], [@batch_count-1]).each do |item|
+        queue_event(item, output_queue)
+      end
+
+      # Below is a commented-out implementation of 'batch fetch'
+      # using pipelined LPOP calls. This in practice has been observed to
+      # perform exactly the same in terms of event throughput as
+      # the evalsha method. Given that the EVALSHA implementation uses
+      # one call to redis instead of N (where N == @batch_count) calls,
+      # I decided to go with the 'evalsha' method of fetching N items
+      # from redis in bulk.
+      #redis.pipelined do
+        #error, item = redis.lpop(@key)
+        #(@batch_count-1).times { redis.lpop(@key) }
+      #end.each do |item|
+        #queue_event(item, output_queue) if item
+      #end
+      # --- End commented out implementation of 'batch fetch'
+    rescue Redis::CommandError => e
+      if e.to_s =~ /NOSCRIPT/ then
+        @logger.warn("Redis may have been restarted, reloading redis batch EVAL script", :exception => e);
+        load_batch_script(redis)
+        retry
+      else
+        raise e
+      end
+    end
   end
 
   private
@@ -151,7 +219,7 @@ class LogStash::Inputs::Redis < LogStash::Inputs::Base
   # loop.
   private
   def listener_loop(listener, output_queue)
-    loop do
+    while !finished?
       begin
         @redis ||= connect
         self.send listener, @redis, output_queue
@@ -160,7 +228,7 @@ class LogStash::Inputs::Redis < LogStash::Inputs::Base
                      :exception => e, :backtrace => e.backtrace)
         raise e
       end
-    end # loop
+    end # while !finished?
   end # listener_loop
 
   public

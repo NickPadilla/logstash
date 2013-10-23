@@ -11,13 +11,13 @@ require "logstash/namespace"
 #
 # You can learn about Riemann here:
 #
-# * <http://aphyr.github.com/riemann/>
+# * <http://riemann.io/>
 # You can see the author talk about it here:
 # * <http://vimeo.com/38377415>
 #
 class LogStash::Outputs::Riemann < LogStash::Outputs::Base
   config_name "riemann"
-  plugin_status "experimental"
+  milestone 1
 
   # The address of the Riemann server.
   config :host, :validate => :string, :default => "localhost"
@@ -37,22 +37,33 @@ class LogStash::Outputs::Riemann < LogStash::Outputs::Base
   # The name of the sender.
   # This sets the `host` value
   # in the Riemann event
-  config :sender, :validate => :string, :default => "%{@source_host}"
+  config :sender, :validate => :string, :default => "%{host}"
 
-  # Hash to set Riemann fields
-  # Values are passed through event.sprintf
-  # so macros are usable here
+  # A Hash to set Riemann event fields
+  # (<http://riemann.io/concepts.html>).
   #
-  # See Events here:
-  # <http://aphyr.github.com/riemann/concepts.html>
+  # The following event fields are supported:
+  # `description`, `state`, `metric`, `ttl`, `service`
   #
-  # The following keys are supported:
-  # description, state, metric, ttl, service
+  # Tags found on the Logstash event will automatically be added to the
+  # Riemann event.
   #
-  # i.e
-  # riemann_event => ["state", "up", "ttl" => "600", "metric" => %{bytes}]
-  # Description, by default, will be set to the event message
-  # but can be overridden here
+  # Any other field set here will be passed to Riemann as an event attribute.
+  #
+  # Example:
+  #
+  #     riemann {
+  #         riemann_event => {
+  #             "metric"  => "%{metric}"
+  #             "service" => "%{service}"
+  #         }
+  #     }
+  #
+  # `metric` and `ttl` values will be coerced to a floating point value.
+  # Values which cannot be coerced will zero (0.0).
+  #
+  # `description`, by default, will be set to the event message
+  # but can be overridden here.
   config :riemann_event, :validate => :hash
 
   #
@@ -68,29 +79,23 @@ class LogStash::Outputs::Riemann < LogStash::Outputs::Base
   public
   def receive(event)
     return unless output?(event)
-    
+
     # Let's build us an event, shall we?
     r_event = Hash.new
     r_event[:host] = event.sprintf(@sender)
     # riemann doesn't handle floats so we reduce the precision here
-    r_event[:time] = event.unix_timestamp.to_i
-    r_event[:description] = event.message
+    r_event[:time] = event["@timestamp"].to_i
+    r_event[:description] = event["message"]
     if @riemann_event
       @riemann_event.each do |key, val|
-        # Catch invalid options since hash syntax doesn't support it
-        unless ["description","state","metric","ttl", "service"].include?(key) 
-          @logger.warn("Invalid key specified in riemann_event", :key => key)
-          next
-        end
-        if ["ttl","metric"].include?(key) 
-          val = val.to_f if ["ttl","metric"].include?(key)
-          r_event[key.to_sym] = val
+        if ["ttl","metric"].include?(key)
+          r_event[key.to_sym] = event.sprintf(val).to_f
         else
           r_event[key.to_sym] = event.sprintf(val)
         end
       end
     end
-    r_event[:tags] = @tags if @tags
+    r_event[:tags] = event["tags"] if event["tags"].is_a?(Array)
     @logger.debug("Riemann event: ", :riemann_event => r_event)
     begin
       proto_client = @client.instance_variable_get("@#{@protocol}")

@@ -2,7 +2,7 @@ require "logstash/inputs/base"
 require "logstash/namespace"
 require "socket" # for Socket.gethostname
 
-# Run command line tools and cature output as an event.
+# Run command line tools and capture the whole output as an event.
 #
 # Notes:
 #
@@ -10,12 +10,12 @@ require "socket" # for Socket.gethostname
 # * The '@message' of this event will be the entire stdout of the command
 #   as one event.
 #
-# TODO(sissel): Implement a 'split' filter so you can split output of this
-# and other messages by newline, etc.
 class LogStash::Inputs::Exec < LogStash::Inputs::Base
 
   config_name "exec"
-  plugin_status "beta"
+  milestone 2
+
+  default :codec, "plain"
   
   # Set this to true to enable debugging on an input.
   config :debug, :validate => :boolean, :default => false
@@ -34,15 +34,19 @@ class LogStash::Inputs::Exec < LogStash::Inputs::Base
 
   public
   def run(queue)
+    hostname = Socket.gethostname
     loop do
       start = Time.now
       @logger.info("Running exec", :command => @command) if @debug
       out = IO.popen(@command)
       # out.read will block until the process finishes.
-      e = to_event(out.read, "exec://#{Socket.gethostname}/")
-      e["command"] = @command
-      queue << e
-
+      @codec.decode(out.read) do |event|
+        decorate(event)
+        event["host"] = hostname
+        event["command"] = @command
+        queue << event
+      end
+      
       duration = Time.now - start
       if @debug
         @logger.info("Command completed", :command => @command,

@@ -4,6 +4,7 @@ require "logstash/filters/date"
 require "logstash/inputs/base"
 require "logstash/namespace"
 require "socket"
+require "thread_safe"
 
 # Read syslog messages as events over the network.
 #
@@ -20,7 +21,9 @@ require "socket"
 # Note: this input will start listeners on both TCP and UDP
 class LogStash::Inputs::Syslog < LogStash::Inputs::Base
   config_name "syslog"
-  plugin_status "experimental"
+  milestone 1
+
+  default :codec, "plain"
 
   # The address to listen on
   config :host, :validate => :string, :default => "0.0.0.0"
@@ -45,36 +48,29 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
     super
     @shutdown_requested = false
     BasicSocket.do_not_reverse_lookup = true
-
-    # force "plain" format. others don't make sense here.
-    @format = "plain"
   end # def initialize
 
   public
   def register
-    @logger.warn("ATTENTION: THIS PLUGIN WILL BE REMOVED IN LOGSTASH 1.2.0")
-    @grok_filter = LogStash::Filters::Grok.new({
-      "type"    => [@config["type"]],
-      "pattern" => ["<%{POSINT:priority}>%{SYSLOGLINE}"],
-    })
+    @grok_filter = LogStash::Filters::Grok.new(
+      "overwrite" => "message",
+      "match" => { "message" => "<%{POSINT:priority}>%{SYSLOGLINE}" },
+    )
 
-    @date_filter = LogStash::Filters::Date.new({
-      "type"          => [@config["type"]],
-      "timestamp"     => ["MMM  d HH:mm:ss", "MMM dd HH:mm:ss"],
-      "timestamp8601" => ["ISO8601"],
-    })
+    @date_filter = LogStash::Filters::Date.new(
+      "match" => [ "timestamp", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss", "ISO8601"]
+    )
 
     @grok_filter.register
     @date_filter.register
 
-    @tcp_clients = []
+    @tcp_clients = ThreadSafe::Array.new
   end # def register
 
   public
   def run(output_queue)
     # udp server
-    Thread.new do
-      LogStash::Util::set_thread_name("input|syslog|udp")
+    udp_thr = Thread.new do
       begin
         udp_listener(output_queue)
       rescue => e
@@ -88,8 +84,7 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
     end # Thread.new
 
     # tcp server
-    Thread.new do
-      LogStash::Util::set_thread_name("input|syslog|tcp")
+    tcp_thr = Thread.new do
       begin
         tcp_listener(output_queue)
       rescue => e
@@ -101,6 +96,11 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
         retry
       end # begin
     end # Thread.new
+
+    # If we exit and we're the only input, the agent will think no inputs
+    # are running and initiate a shutdown.
+    udp_thr.join
+    tcp_thr.join
   end # def run
 
   private
@@ -108,21 +108,20 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
     @logger.info("Starting syslog udp listener", :address => "#{@host}:#{@port}")
 
     if @udp
-      @udp.close_read
-      @udp.close_write
+      @udp.close
     end
 
     @udp = UDPSocket.new(Socket::AF_INET)
     @udp.bind(@host, @port)
 
     loop do
-      line, client = @udp.recvfrom(9000)
+      payload, client = @udp.recvfrom(9000)
       # Ruby uri sucks, so don't use it.
-      source = "syslog://#{client[3]}/"
-      e = to_event(line.chomp, source)
-      if e
-        syslog_relay(e, source)
-        output_queue << e
+      @codec.decode(payload) do |event|
+        decorate(event)
+        event["host"] = client[3]
+        syslog_relay(event)
+        output_queue << event
       end
     end
   ensure
@@ -142,21 +141,18 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
         ip, port = client.peeraddr[3], client.peeraddr[1]
         @logger.info("new connection", :client => "#{ip}:#{port}")
         LogStash::Util::set_thread_name("input|syslog|tcp|#{ip}:#{port}}")
-        if ip.include?(":") # ipv6
-          source = "syslog://[#{ip}]/"
-        else
-          source = "syslog://#{ip}/"
-        end
-
         begin
-        client.each do |line|
-          e = to_event(line.chomp, source)
-          if e
-            syslog_relay(e, source)
-            output_queue << e
-          end # e
-        end # client.each
+          client.each do |line|
+            @codec.decode(line) do |event|
+              decorate(event)
+              event["host"] = ip
+              syslog_relay(event)
+              output_queue << event
+            end
+          end
         rescue Errno::ECONNRESET
+        ensure
+          @tcp_clients.delete(client)
         end
       end # Thread.new
     end # loop do
@@ -194,51 +190,46 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
   # Following RFC3164 where sane, we'll try to parse a received message
   # as if you were relaying a syslog message to it.
   # If the message cannot be recognized (see @grok_filter), we'll
-  # treat it like the whole event.message is correct and try to fill
+  # treat it like the whole event["message"] is correct and try to fill
   # the missing pieces (host, priority, etc)
   public
-  def syslog_relay(event, url)
+  def syslog_relay(event)
     @grok_filter.filter(event)
 
-    if !event.tags.include?("_grokparsefailure")
+    if event["tags"].nil? || !event["tags"].include?("_grokparsefailure")
       # Per RFC3164, priority = (facility * 8) + severity
       #                       = (facility << 3) & (severity)
-      priority = event.fields["priority"].first.to_i rescue 13
+      priority = event["priority"].first.to_i rescue 13
       severity = priority & 7   # 7 is 111 (3 bits)
       facility = priority >> 3
-      event.fields["priority"] = priority
-      event.fields["severity"] = severity
-      event.fields["facility"] = facility
+      event["priority"] = priority
+      event["severity"] = severity
+      event["facility"] = facility
 
+      event["timestamp"] = event["timestamp8601"] if event.include?("timestamp8601")
       @date_filter.filter(event)
     else
-      @logger.info("NOT SYSLOG", :message => event.message)
-      url = "syslog://#{Socket.gethostname}/" if url == "syslog://127.0.0.1/"
+      @logger.info? && @logger.info("NOT SYSLOG", :message => event["message"])
 
       # RFC3164 says unknown messages get pri=13
       priority = 13
-      event.fields["priority"] = 13
-      event.fields["severity"] = 5   # 13 & 7 == 5
-      event.fields["facility"] = 1   # 13 >> 3 == 1
-
-      # Don't need to modify the message, here.
-      # event.message = ...
-
-      event.source = url
+      event["priority"] = 13
+      event["severity"] = 5   # 13 & 7 == 5
+      event["facility"] = 1   # 13 >> 3 == 1
     end
 
     # Apply severity and facility metadata if
     # use_labels => true
     if @use_labels
-      facility_number = event.fields["facility"]
-      severity_number = event.fields["severity"]
+      facility_number = event["facility"]
+      severity_number = event["severity"]
 
       if @facility_labels[facility_number]
-        event.fields["facility_label"] = @facility_labels[facility_number]
+        event["facility_label"] = @facility_labels[facility_number]
       end
 
       if @severity_labels[severity_number]
-        event.fields["severity_label"] = @severity_labels[severity_number]
+        event["severity_label"] = @severity_labels[severity_number]
       end
     end
   end # def syslog_relay

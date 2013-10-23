@@ -1,4 +1,4 @@
-require "logstash/inputs/base"
+require "logstash/inputs/threadable"
 require "logstash/namespace"
 require "socket" # for Socket.gethostname
 
@@ -7,9 +7,11 @@ require "socket" # for Socket.gethostname
 # The general intention of this is to test performance of plugins.
 #
 # An event is generated first
-class LogStash::Inputs::Generator < LogStash::Inputs::Base
+class LogStash::Inputs::Generator < LogStash::Inputs::Threadable
   config_name "generator"
-  plugin_status "experimental"
+  milestone 3
+
+  default :codec, "plain"
 
   # The message string to use in the event.
   #
@@ -19,16 +21,41 @@ class LogStash::Inputs::Generator < LogStash::Inputs::Base
   # Otherwise, this value will be used verbatim as the event message.
   config :message, :validate => :string, :default => "Hello world!"
 
+  # The lines to emit, in order. This option cannot be used with the 'message'
+  # setting.
+  #
+  # Example:
+  #
+  #     input {
+  #       generator {
+  #         lines => [
+  #           "line 1",
+  #           "line 2",
+  #           "line 3"
+  #         ]
+  #       }
+  #
+  #       # Emit all lines 3 times.
+  #       count => 3
+  #     }
+  #
+  # The above will emit "line 1" then "line 2" then "line", then "line 1", etc... 
+  config :lines, :validate => :array
+
+  # Set how many messages should be generated.
+  #
+  # The default, 0, means generate an unlimited number of events.
+  config :count, :validate => :number, :default => 0
+
   public
   def register
     @host = Socket.gethostname
-    @metric_generate = @logger.metrics.timer(self, "event-generation")
-    @metric_queue_write = @logger.metrics.timer(self, "queue-write-time")
+    @count = @count.first if @count.is_a?(Array)
+    @lines = [@message] if @lines.nil?
   end # def register
 
   def run(queue)
     number = 0
-    source = "stdin://#{@host}/"
 
     if @message == "stdin"
       @logger.info("Generator plugin reading a line from stdin")
@@ -36,21 +63,35 @@ class LogStash::Inputs::Generator < LogStash::Inputs::Base
       @logger.debug("Generator line read complete", :message => @message)
     end
 
-    while !finished?
-      @metric_generate.time do
-        event = to_event(@message, source)
-        event["sequence"] = number
-        # Time how long each queue push takes.
-        number += 1
-        @metric_queue_write.time do
+    while !finished? && (@count <= 0 || number < @count)
+      @lines.each do |line|
+        @codec.decode(line.clone) do |event|
+          decorate(event)
+          event["host"] = @host
+          event["sequence"] = number
           queue << event
         end
       end
+      number += 1
     end # loop
+
+    if @codec.respond_to?(:flush)
+      @codec.flush do |event|
+        decorate(event)
+        event["host"] = @host
+        queue << event
+      end
+    end
+    sleep 3
   end # def run
 
   public
   def teardown
+    @codec.flush do |event|
+      decorate(event)
+      event["host"] = @host
+      queue << event
+    end
     finished
   end # def teardown
-end # class LogStash::Inputs::Stdin
+end # class LogStash::Inputs::Generator

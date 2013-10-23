@@ -3,15 +3,14 @@ require "erb"
 require "optparse"
 require "bluecloth" # for markdown parsing
 
-# TODO(sissel): Currently this doc generator doesn't follow ancestry, so
-# LogStash::Input::Amqp inherits Base, but we don't parse the base file.
-# We need this, though.
-#
-# TODO(sissel): Convert this to use ERB, not random bits of 'puts'
-
 $: << Dir.pwd
 $: << File.join(File.dirname(__FILE__), "..", "lib")
 
+require "logstash/config/mixin"
+require "logstash/inputs/base"
+require "logstash/codecs/base"
+require "logstash/filters/base"
+require "logstash/outputs/base"
 require "logstash/version"
 
 class LogStashConfigDocGenerator
@@ -20,20 +19,18 @@ class LogStashConfigDocGenerator
   def initialize
     @rules = {
       COMMENT_RE => lambda { |m| add_comment(m[1]) },
-      /^ *class.*< *LogStash::(Outputs|Filters|Inputs)::Base/ => \
+      /^ *class.*< *LogStash::(Outputs|Filters|Inputs|Codecs)::(Base|Threadable)/ => \
         lambda { |m| set_class_description },
       /^ *config +[^=].*/ => lambda { |m| add_config(m[0]) },
-      /^ *plugin_status .*/ => lambda { |m| set_plugin_status(m[0]) },
+      /^ *milestone .*/ => lambda { |m| set_milestone(m[0]) },
       /^ *config_name .*/ => lambda { |m| set_config_name(m[0]) },
       /^ *flag[( ].*/ => lambda { |m| add_flag(m[0]) },
       /^ *(class|def|module) / => lambda { |m| clear_comments },
     }
-    @comments = []
-    @settings = {}
-    @flags = {}
   end
 
   def parse(string)
+    clear_comments
     buffer = ""
     string.split(/\r\n|\n/).each do |line|
       # Join long lines
@@ -41,7 +38,7 @@ class LogStashConfigDocGenerator
         # nothing
       else
         # Join extended lines
-        if line =~ /(, *$)|(\\$)/
+        if line =~ /(, *$)|(\\$)|(\[ *$)/
           buffer += line.gsub(/\\$/, "")
           next
         end
@@ -69,24 +66,28 @@ class LogStashConfigDocGenerator
   end # def add_comment
 
   def add_config(code)
-    # trim off any possible multiline lamdas for a :validate
-    code.sub!(/, *:validate => \(lambda.*$/, '')
+    # I just care about the 'config :name' part
+    code = code.sub(/,.*/, "")
 
     # call the code, which calls 'config' in this class.
     # This will let us align comments with config options.
     name, opts = eval(code)
 
+    # TODO(sissel): This hack is only required until regexp configs
+    # are gone from logstash.
+    name = name.to_s unless name.is_a?(Regexp)
+
     description = BlueCloth.new(@comments.join("\n")).to_html
-    @settings[name] = opts.merge(:description => description)
+    @attributes[name][:description] = description
     clear_comments
   end # def add_config
 
   def add_flag(code)
     # call the code, which calls 'config' in this class.
     # This will let us align comments with config options.
-    p :code => code
+    #p :code => code
     fixed_code = code.gsub(/ do .*/, "")
-    p :fixedcode => fixed_code
+    #p :fixedcode => fixed_code
     name, description = eval(fixed_code)
     @flags[name] = description
     clear_comments
@@ -97,9 +98,8 @@ class LogStashConfigDocGenerator
     @name = name
   end # def set_config_name
 
-  def set_plugin_status(code)
-    status = eval(code)
-    @plugin_status = status
+  def set_milestone(code)
+    @milestone = eval(code)
   end
 
   # pretend to be the config DSL and just get the name
@@ -119,31 +119,56 @@ class LogStashConfigDocGenerator
     return name
   end # def config_name
 
-  # pretend to be the config dsl's 'plugin_status' method
-  def plugin_status(status)
-    return status
-  end # def plugin_status
+  # pretend to be the config dsl's 'milestone' method
+  def milestone(m)
+    return m
+  end # def milestone
 
   def clear_comments
     @comments.clear
   end # def clear_comments
 
   def generate(file, settings)
-    require "logstash/inputs/base"
-    require "logstash/filters/base"
-    require "logstash/outputs/base"
-    require file
-
-    @comments = []
-    @settings = {}
     @class_description = ""
-    @plugin_status = ""
+    @milestone = ""
+    @comments = []
+    @attributes = Hash.new { |h,k| h[k] = {} }
+    @flags = {}
+
+    # local scoping for the monkeypatch belowg
+    attributes = @attributes
+    # Monkeypatch the 'config' method to capture
+    # Note, this monkeypatch requires us do the config processing
+    # one at a time.
+    #LogStash::Config::Mixin::DSL.instance_eval do
+      #define_method(:config) do |name, opts={}|
+        #p name => opts
+        #attributes[name].merge!(opts)
+      #end
+    #end
+
+    # Loading the file will trigger the config dsl which should
+    # collect all the config settings.
+    load file
 
     # parse base first
     parse(File.new(File.join(File.dirname(file), "base.rb"), "r").read)
 
     # Now parse the real library
     code = File.new(file).read
+
+    # inputs either inherit from Base or Threadable.
+    if code =~ /\< LogStash::Inputs::Threadable/
+      parse(File.new(File.join(File.dirname(file), "threadable.rb"), "r").read)
+    end
+
+    if code =~ /include LogStash::PluginMixins/
+      mixin = code.gsub(/.*include LogStash::PluginMixins::(\w+)\s.*/m, '\1')
+      mixin.gsub!(/(.)([A-Z])/, '\1_\2')
+      mixin.downcase!
+      parse(File.new(File.join(File.dirname(file), "..", "plugin_mixins", "#{mixin}.rb")).read)
+    end
+    
     parse(code)
 
     puts "Generating docs for #{file}"
@@ -160,6 +185,8 @@ class LogStashConfigDocGenerator
       section = "filter"
     elsif klass.ancestors.include?(LogStash::Outputs::Base)
       section = "output"
+    elsif klass.ancestors.include?(LogStash::Codecs::Base)
+      section = "codec"
     end
 
     template_file = File.join(File.dirname(__FILE__), "plugin-doc.html.erb")
@@ -168,9 +195,15 @@ class LogStashConfigDocGenerator
     # descriptions are assumed to be markdown
     description = BlueCloth.new(@class_description).to_html
 
-    sorted_settings = @settings.sort { |a,b| a.first.to_s <=> b.first.to_s }
+    klass.get_config.each do |name, settings|
+      @attributes[name].merge!(settings)
+    end
+    sorted_attributes = @attributes.sort { |a,b| a.first.to_s <=> b.first.to_s }
     klassname = LogStash::Config::Registry.registry[@name].to_s
     name = @name
+
+    synopsis_file = File.join(File.dirname(__FILE__), "plugin-synopsis.html.erb")
+    synopsis = ERB.new(File.new(synopsis_file).read, nil, "-").result(binding)
 
     if settings[:output]
       dir = File.join(settings[:output], section + "s")
@@ -180,6 +213,7 @@ class LogStashConfigDocGenerator
       File.open(path, "w") do |out|
         html = template.result(binding)
         html.gsub!("%VERSION%", LOGSTASH_VERSION)
+        html.gsub!("%PLUGIN%", @name)
         out.puts(html)
       end
     else 

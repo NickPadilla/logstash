@@ -1,21 +1,36 @@
 require "logstash/namespace"
 require "logstash/outputs/base"
+require "stud/buffer"
 
 # This output lets you store logs in elasticsearch and is the most recommended
 # output for logstash. If you plan on using the logstash web interface, you'll
 # need to use this output.
 #
-#   *NOTE*: You must use the same version of elasticsearch server that logstash
-#   uses for its client. Currently we use elasticsearch 0.18.7
+#   *VERSION NOTE*: Your elasticsearch cluster must be running elasticsearch
+#   %ELASTICSEARCH_VERSION%. If you use any other version of elasticsearch,
+#   you should consider using the [elasticsearch_http](elasticsearch_http)
+#   output instead.
+#
+# If you want to set other elasticsearch options that are not exposed directly
+# as config options, there are two options:
+#
+# * create an elasticsearch.yml file in the $PWD of the logstash process
+# * pass in es.* java properties (java -Des.node.foo= or ruby -J-Des.node.foo=)
+#
+# This plugin will join your elasticsearch cluster, so it will show up in
+# elasticsearch's cluster health status.
 #
 # You can learn more about elasticsearch at <http://elasticsearch.org>
+#
+# ## Operational Notes
+#
+# Your firewalls will need to permit port 9300 in *both* directions (from
+# logstash to elasticsearch, and elasticsearch to logstash)
 class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
+  include Stud::Buffer
 
   config_name "elasticsearch"
-  plugin_status "stable"
-
-  # ElasticSearch server name. This is optional if your server is discoverable.
-  config :host, :validate => :string
+  milestone 3
 
   # The index to write events to. This can be dynamic using the %{foo} syntax.
   # The default value will partition your indices by day so you can more easily
@@ -24,7 +39,11 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
   # The index type to write events to. Generally you should try to write only
   # similar events to the same 'type'. String expansion '%{foo}' works here.
-  config :index_type, :validate => :string, :default => "%{@type}"
+  config :index_type, :validate => :string
+
+  # The document ID for the index. Useful for overwriting existing entries in
+  # elasticsearch with the same ID.
+  config :document_id, :validate => :string, :default => nil
 
   # The name of your cluster if you set it on the ElasticSearch side. Useful
   # for discovery.
@@ -37,7 +56,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
 
   # The port for ElasticSearch transport to use. This is *not* the ElasticSearch
   # REST API port (normally 9200).
-  config :port, :validate => :number, :default => 9300
+  config :port, :validate => :string, :default => "9300-9305"
 
   # The name/address of the host to bind to for ElasticSearch clustering
   config :bind_host, :validate => :string
@@ -53,59 +72,65 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   # default.
   config :embedded_http_port, :validate => :string, :default => "9200-9300"
 
-  # Configure the maximum number of in-flight requests to ElasticSearch.
+  # This setting no longer does anything. It exists to keep config validation
+  # from failing. It will be removed in future versions.
+  config :max_inflight_requests, :validate => :number, :default => 50, :deprecated => true
+
+  # The node name ES will use when joining a cluster.
   #
-  # Note: This setting may be removed in the future.
-  config :max_inflight_requests, :validate => :number, :default => 50
+  # By default, this is generated internally by the ES client.
+  config :node_name, :validate => :string
+
+  # The maximum number of events to spool before flushing to elasticsearch.
+  config :flush_size, :validate => :number, :default => 100
+
+  # The amount of time since last flush before a flush is forced.
+  config :idle_flush_time, :validate => :number, :default => 1
 
   public
   def register
     # TODO(sissel): find a better way of declaring where the elasticsearch
     # libraries are
     # TODO(sissel): can skip this step if we're running from a jar.
-    jarpath = File.join(File.dirname(__FILE__), "../../../vendor/**/*.jar")
+    jarpath = File.join(File.dirname(__FILE__), "../../../vendor/jar/elasticsearch*/lib/*.jar")
     Dir[jarpath].each do |jar|
-        require jar
+      require jar
     end
 
     # setup log4j properties for elasticsearch
-    @logger.setup_log4j
+    LogStash::Logger.setup_log4j(@logger)
 
     if @embedded
-      # Check for settings that are incompatible with @embedded
-      %w(host).each do |name|
-        if instance_variable_get("@#{name}")
-          @logger.error("outputs/elasticsearch: You cannot specify " \
-                        "'embedded => true' and also set '#{name}'")
-          raise "Invalid configuration detected. Please fix."
-        end
-      end
+      # Default @host with embedded to localhost. This should help avoid
+      # newbies tripping on ubuntu and other distros that have a default
+      # firewall that blocks multicast.
+      @host ||= "localhost"
 
       # Start elasticsearch local.
       start_local_elasticsearch
     end
-
     require "jruby-elasticsearch"
 
     @logger.info("New ElasticSearch output", :cluster => @cluster,
                  :host => @host, :port => @port, :embedded => @embedded)
-    @pending = []
     options = {
       :cluster => @cluster,
       :host => @host,
       :port => @port,
       :bind_host => @bind_host,
+      :node_name => @node_name,
     }
 
     # TODO(sissel): Support 'transport client'
     options[:type] = :node
 
     @client = ElasticSearch::Client.new(options)
-    @inflight_requests = 0
-    @inflight_mutex = Mutex.new
-    @inflight_cv = ConditionVariable.new
 
-    # TODO(sissel): Set up the bulkstream.
+    buffer_initialize(
+      :max_items => @flush_size,
+      :max_interval => @idle_flush_time,
+      :logger => @logger
+    )
   end # def register
 
   protected
@@ -115,6 +140,7 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     # Disable 'local only' - LOGSTASH-277
     #builder.local(true)
     builder.settings.put("cluster.name", @cluster) if !@cluster.nil?
+    builder.settings.put("node.name", @node_name) if !@node_name.nil?
     builder.settings.put("http.port", @embedded_http_port)
 
     @embedded_elasticsearch = builder.node
@@ -124,62 +150,24 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   public
   def receive(event)
     return unless output?(event)
+    buffer_receive([event, event.sprintf(@index), event.sprintf(@index_type)])
+  end # def receive
 
-    index = event.sprintf(@index)
-    type = event.sprintf(@index_type)
-    # TODO(sissel): allow specifying the ID?
-    # The document ID is how elasticsearch determines sharding hash, so it can
-    # help performance if we allow folks to specify a specific ID.
-    # TODO(sissel): Use the bulk index api, but to do this I need to figure out
-    # how to handle indexing errors especially related to part of the full bulk
-    # request. In the mean-time, keep track of the number of outstanding requests
-    # and block if we reach that maximum.
-
-    # If current in-flight requests exceeds max_inflight_requests, block until
-    # it doesn't.
-    @inflight_mutex.synchronize do
-      # Keep blocking until it's safe to send new requests.
-      while @inflight_requests >= @max_inflight_requests
-        @logger.info("Too many active ES requests, blocking now.", 
-                     :inflight_requests => @inflight_requests,
-                     :max_inflight_requests => @max_inflight_requests);
-        @inflight_cv.wait(@inflight_mutex)
+  def flush(events, teardown=false)
+    request = @client.bulk
+    events.each do |event, index, type|
+      type = "logs" if type.empty?
+      if @document_id
+        request.index(index, type, event.sprintf(@document_id), event.to_json)
+      else
+        request.index(index, type, nil, event.to_json)
       end
     end
 
-    req = @client.index(index, type, event.to_hash) 
-    increment_inflight_request_count
-    #timer = @logger.time("elasticsearch write")
-    req.on(:success) do |response|
-      @logger.debug("Successfully indexed", :event => event.to_hash)
-      #timer.stop
-      decrement_inflight_request_count
-    end.on(:failure) do |exception|
-      @logger.debug("Failed to index an event", :exception => exception,
-                    :event => event.to_hash)
-      #timer.stop
-      decrement_inflight_request_count
-    end
+    request.execute!
+    # TODO(sissel): Handle errors. Since bulk requests could mostly succeed
+    # (aka partially fail), we need to figure out what documents need to be
+    # retried.
+  end # def flush
 
-    # Execute this request asynchronously.
-    req.execute
-  end # def receive
-
-  # Ruby doesn't appear to have a semaphore implementation, so this is a
-  # hack until I write one.
-  private
-  def increment_inflight_request_count
-    @inflight_mutex.synchronize do
-      @inflight_requests += 1
-      @logger.info("ElasticSearch in-flight requests", :count => @inflight_requests)
-    end
-  end # def increment_inflight_request_count
-
-  private
-  def decrement_inflight_request_count
-    @inflight_mutex.synchronize do
-      @inflight_requests -= 1
-      @inflight_cv.signal
-    end
-  end # def decrement_inflight_request_count
 end # class LogStash::Outputs::Elasticsearch

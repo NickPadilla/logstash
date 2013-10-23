@@ -2,7 +2,6 @@ require "logstash/outputs/base"
 require "logstash/namespace"
 require "thread"
 
-
 # Write events over a TCP socket.
 #
 # Each event json is separated by a newline.
@@ -12,7 +11,9 @@ require "thread"
 class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
   config_name "tcp"
-  plugin_status "beta"
+  milestone 2
+
+  default :codec, "json"
 
   # When mode is `server`, the address to listen on.
   # When mode is `client`, the address to connect to.
@@ -21,10 +22,21 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
   # When mode is `server`, the port to listen on.
   # When mode is `client`, the port to connect to.
   config :port, :validate => :number, :required => true
+  
+  # When connect failed,retry interval in sec.
+  config :reconnect_interval, :validate => :number, :default => 10
 
   # Mode to operate in. `server` listens for client connections,
   # `client` connects to a server.
   config :mode, :validate => ["server", "client"], :default => "client"
+
+  # The format to use when writing events to the file. This value
+  # supports any string and can include %{name} and other dynamic
+  # strings.
+  #
+  # If this setting is omitted, the full json representation of the
+  # event will be written as a single line.
+  config :message_format, :validate => :string, :deprecated => true
 
   class Client
     public
@@ -41,7 +53,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
           @socket.write(@queue.pop)
         rescue => e
           @logger.warn("tcp output exception", :socket => @socket,
-                       :exception => e, :backtrace => e.backtrace)
+                       :exception => e)
           break
         end
       end
@@ -55,7 +67,10 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
   public
   def register
+    require "stud/try"
     if server?
+      workers_not_supported
+
       @logger.info("Starting tcp output listener", :address => "#{@host}:#{@port}")
       @server_socket = TCPServer.new(@host, @port)
       @client_threads = []
@@ -70,14 +85,43 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
           @client_threads << client_thread
         end
       end
+
+      @codec.on_event do |payload|
+        @client_threads.each do |client_thread|
+          client_thread[:client].write(payload)
+        end
+        @client_threads.reject! {|t| !t.alive? }
+      end
     else
-      @client_socket = nil
+      client_socket = nil
+      @codec.on_event do |payload|
+        begin
+          client_socket = connect unless client_socket
+          r,w,e = IO.select([client_socket], [client_socket], [client_socket], nil)
+          # don't expect any reads, but a readable socket might
+          # mean the remote end closed, so read it and throw it away.
+          # we'll get an EOFError if it happens.
+          client_socket.sysread(16384) if r.any?
+
+          # Now send the payload
+          client_socket.syswrite(payload) if w.any?
+        rescue => e
+          @logger.warn("tcp output exception", :host => @host, :port => @port,
+                       :exception => e, :backtrace => e.backtrace)
+          client_socket.close rescue nil
+          client_socket = nil
+          sleep @reconnect_interval
+          retry
+        end
+      end
     end
   end # def register
 
   private
   def connect
-    @client_socket = TCPSocket.new(@host, @port)
+    Stud::try do
+      return TCPSocket.new(@host, @port)
+    end
   end # def connect
 
   private
@@ -89,24 +133,12 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
   def receive(event)
     return unless output?(event)
 
-    wire_event = event.to_hash.to_json + "\n"
-
-    if server?
-      @client_threads.each do |client_thread|
-        client_thread[:client].write(wire_event)
-      end
-
-      @client_threads.reject! {|t| !t.alive? }
-    else
-      begin
-        connect unless @client_socket
-        @client_socket.write(event.to_hash.to_json)
-        @client_socket.write("\n")
-      rescue => e
-        @logger.warn("tcp output exception", :host => @host, :port => @port,
-                     :exception => e, :backtrace => e.backtrace)
-        @client_socket = nil
-      end
-    end
+    #if @message_format
+      #output = event.sprintf(@message_format) + "\n"
+    #else
+      #output = event.to_hash.to_json + "\n"
+    #end
+    
+    @codec.encode(event)
   end # def receive
 end # class LogStash::Outputs::Tcp

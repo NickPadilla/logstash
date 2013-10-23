@@ -1,14 +1,14 @@
 ---
-title: Logstash tutorial @ Dreamforce
+title: Logstash 10-Minute Tutorial
 layout: content_right
 ---
-# Logstash tutorial @ Dreamforce
+# Logstash 10-minute Tutorial
 
 ## Step 1 - Download
 
 ### Download logstash:
 
-* [logstash-%VERSION%-monolithic.jar](http://semicomplete.com/files/logstash/logstash-%VERSION%-monolithic.jar)
+* [logstash-%VERSION%-flatjar.jar](http://logstash.objects.dreamhost.com/release/logstash-%VERSION%-flatjar.jar)
 
 ### Requirements:
 
@@ -16,8 +16,9 @@ layout: content_right
 
 ### The Secret:
 
-logstash is written in JRuby but I release standalone jar files for easy
+logstash is written in JRuby, but I release standalone jar files for easy
 deployment, so you don't need to download JRuby or most any other dependencies.
+
 I bake as much as possible into the single release file.
 
 ## Step 2 - A hello world.
@@ -28,7 +29,7 @@ I bake as much as possible into the single release file.
 
 ### Run it:
 
-    java -jar logstash-%VERSION%-monolithic.jar agent -f hello.conf
+    java -jar logstash-%VERSION%-flatjar.jar agent -f hello.conf
 
 Type stuff on standard input. Press enter. Watch what event logstash sees.
 Press ^C to kill it.
@@ -41,12 +42,12 @@ Press ^C to kill it.
 
 ### Run it:
 
-    java -jar logstash-%VERSION%-monolithic.jar agent -f hello-search.conf
+    java -jar logstash-%VERSION%-flatjar.jar agent -f hello-search.conf
 
 Same config as step 2, but now we are also writing events to ElasticSearch. Do
-a search for '*' (all):
+a search for `*` (all):
 
-    curl http://localhost:9200/_search?pretty=1&q=*
+    curl 'http://localhost:9200/_search?pretty=1&q=*'
 
 ## Step 4 - logstash web
 
@@ -56,7 +57,7 @@ The same config as step 3 is used.
 
 ### Run it:
 
-    java -jar logstash-%VERSION%-monolithic.jar agent -f hello-search.conf -- web --backend 'elasticsearch:///?local'
+    java -jar logstash-%VERSION%-flatjar.jar agent -f hello-search.conf -- web
 
 The above runs both the agent and the logstash web interface in the same
 process. Useful for simple deploys.
@@ -71,12 +72,7 @@ Type stuff on stdin on the agent, then search for it in the web interface.
 
 Let's backfill some old apache logs.  First, let's use grok.
 
-Requirements:
-
-* libgrok [INSTALL notes here](https://github.com/jordansissel/grok/blob/master/INSTALL)
-
-Use the 'grok' logstash filter to parse logs. Once you have libgrok installed,
-keep reading below.
+Use the ['grok'](../../filters/grok) logstash filter to parse logs. 
 
 ### Download
 
@@ -85,7 +81,7 @@ keep reading below.
 
 ### Run it
 
-    java -jar logstash-%VERSION%-monolithic.jar agent -f apache-parse.conf
+    java -jar logstash-%VERSION%-flatjar.jar agent -f apache-parse.conf
 
 Logstash will now be listening on TCP port 3333. Send an apache log message at it:
 
@@ -104,7 +100,7 @@ Same as the previous step, but we'll output to ElasticSearch now.
 
 ### Run it
 
-    java -jar logstash-%VERSION%-monolithic.jar agent -f apache-elasticsearch.conf -- web --backend 'elasticsearch:///?local'
+    java -jar logstash-%VERSION%-flatjar.jar agent -f apache-elasticsearch.conf -- web
 
 Logstash should be all set for you now. Start feeding it logs:
 
@@ -114,14 +110,14 @@ Logstash should be all set for you now. Start feeding it logs:
 
 Go to the logstash web interface in browser: <http://localhost:9292/>
 
-Try some search queries. To see all the data, search for '*' (no quotes). Click
+Try some search queries. To see all the data, search for `*` (no quotes). Click
 on some results, drill around in some logs.
 
 ## Want more?
 
 For further learning, try these:
 
-* [Watch a presentation on logstash](http://blip.tv/carolinacon/logstash-open-source-log-and-event-management-jordan-sissel-5123601)
+* [Watch a presentation on logstash](http://www.youtube.com/embed/RuUFnog29M4)
 * [Getting started 'standalone' guide](http://logstash.net/docs/%VERSION%/tutorials/getting-started-simple)
 * [Getting started 'centralized' guide](http://logstash.net/docs/%VERSION%/tutorials/getting-started-centralized) - 
   learn how to build out your logstash infrastructure and centralize your logs.

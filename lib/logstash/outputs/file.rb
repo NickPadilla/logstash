@@ -9,10 +9,15 @@ require "zlib"
 class LogStash::Outputs::File < LogStash::Outputs::Base
 
   config_name "file"
-  plugin_status "beta"
+  milestone 2
 
   # The path to the file to write. Event fields can be used here, 
-  # like "/var/log/logstash/%{@source_host}/%{application}"
+  # like "/var/log/logstash/%{host}/%{application}"
+  # One may also utilize the path option for date-based log 
+  # rotation via the joda time format. This will use the event
+  # timestamp.
+  # E.g.: path => "./test-%{+YYYY-MM-dd}.txt" to create 
+  # ./test-2013-05-29.txt 
   config :path, :validate => :string, :required => true
 
   # The maximum size of file to write. When the file exceeds this
@@ -40,15 +45,15 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   public
   def register
     require "fileutils" # For mkdir_p
+
+    workers_not_supported
+
     @files = {}
     now = Time.now
     @last_flush_cycle = now
     @last_stale_cleanup_cycle = now
     flush_interval = @flush_interval.to_i
     @stale_cleanup_interval = 10
-    @metric_flushes = @logger.metrics.timer(self, "flushes")
-    @metric_write_delay = @logger.metrics.timer(self, "write-delay")
-    @metric_write_bytes = @logger.metrics.histogram(self, "write-bytes")
   end # def register
 
   public
@@ -61,15 +66,13 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     # TODO(sissel): Check if we should rotate the file.
 
     if @message_format
-      output = event.sprintf(@message_format) + "\n"
+      output = event.sprintf(@message_format)
     else
       output = event.to_json
     end
 
-    @metric_write_delay.time do
-      fd.puts(output)
-    end
-    @metric_write_bytes.record(output.size)
+    fd.write(output)
+    fd.write("\n")
 
     flush(fd)
     close_stale_files
@@ -93,9 +96,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     if flush_interval > 0
       flush_pending_files
     else
-      @metric_flushes.time do
-        fd.flush
-      end
+      fd.flush
     end
   end
 
@@ -105,9 +106,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     @logger.debug("Starting flush cycle")
     @files.each do |path, fd|
       @logger.debug("Flushing file", :path => path, :fd => fd)
-      @metric_flushes.time do
-        fd.flush
-      end
+      fd.flush
     end
     @last_flush_cycle = Time.now
   end

@@ -9,41 +9,38 @@ require "logstash/outputs/base"
 #  * "nagios_host"
 #  * "nagios_service"
 #
-# This field is supported, but optional:
-#   "nagios_annotation"
+# These fields are supported, but optional:
 #
-# The easiest way to use this output is with the grep filter.
-# Presumably, you only want certain events matching a given pattern
-# to send events to nagios. So use grep to match and also to add the required
-# fields.
+#  * "nagios_annotation"
+#  * "nagios_level"
 #
-#     filter {
-#       grep {
-#         type => "linux-syslog"
-#         match => [ "@message", "(error|ERROR|CRITICAL)" ]
-#         add_tag => [ "nagios-update" ]
-#         add_fields => [
-#           "nagios_host", "%{@source_host}",
-#           "nagios_service", "the name of your nagios service check"
-#         ]
-#       }
-#     }
-#    
+# There are two configuration options:
+#
+#  * commandfile - The location of the Nagios external command file
+#  * nagios_level - Specifies the level of the check to be sent. Defaults to
+#    CRITICAL and can be overriden by setting the "nagios_level" field to one
+#    of "OK", "WARNING", "CRITICAL", or "UNKNOWN" 
+#
+#         match => [ "message", "(error|ERROR|CRITICAL)" ]
+#
 #     output{
-#       nagios { 
-#         # only process events with this tag
-#         tags => "nagios-update"
+#       if [message] =~ /(error|ERROR|CRITICAL)/ {
+#         nagios {
+#           # your config here
+#         }
 #       }
 #     }
 class LogStash::Outputs::Nagios < LogStash::Outputs::Base
-  NAGIOS_CRITICAL = 2
-  NAGIOS_WARN = 1
 
   config_name "nagios"
-  plugin_status "beta"
+  milestone 2
 
   # The path to your nagios command file
-  config :commandfile, :validate => :string, :default => "/var/lib/nagios3/rw/nagios.cmd"
+  config :commandfile, :validate => :path, :default => "/var/lib/nagios3/rw/nagios.cmd"
+
+  # The Nagios check level. Should be one of 0=OK, 1=WARNING, 2=CRITICAL,
+  # 3=UNKNOWN. Defaults to 2 - CRITICAL.
+  config :nagios_level, :validate => [ "0", "1", "2", "3" ], :default => "2"
 
   public
   def register
@@ -65,33 +62,45 @@ class LogStash::Outputs::Nagios < LogStash::Outputs::Base
     # array indexes (host/service combos) and the arrays must be the same
     # length.
 
-    host = event.fields["nagios_host"]
+    host = event["nagios_host"]
     if !host
       @logger.warn("Skipping nagios output; nagios_host field is missing",
                    :missed_event => event)
       return
     end
 
-    service = event.fields["nagios_service"]
+    service = event["nagios_service"]
     if !service
       @logger.warn("Skipping nagios output; nagios_service field is missing",
                    "missed_event" => event)
       return
     end
 
-    annotation = event.fields["nagios_annotation"]
-    level = NAGIOS_CRITICAL
-    if event.fields["nagios_level"] and event.fields["nagios_level"][0].downcase == "warn"
-      level = NAGIOS_WARN
+    annotation = event["nagios_annotation"]
+    level = @nagios_level
+
+    if event["nagios_level"]
+      event_level = [*event["nagios_level"]]
+      case event_level[0].downcase
+      when "ok"
+        level = "0"
+      when "warning"
+        level = "1"
+      when "critical"
+        level = "2"
+      when "unknown"
+        level = "3"
+      else
+        @logger.warn("Invalid Nagios level. Defaulting to CRITICAL", :data => event_level)
+      end
     end
 
-    cmd = "[#{Time.now.to_i}] PROCESS_SERVICE_CHECK_RESULT;#{host[0]};#{service[0]};#{level};"
+    cmd = "[#{Time.now.to_i}] PROCESS_SERVICE_CHECK_RESULT;#{host};#{service};#{level};"
     if annotation
-      cmd += "#{annotation[0]}: "
+      cmd += "#{annotation}: "
     end
-    cmd += "#{event.source}: "
     # In the multi-line case, escape the newlines for the nagios command file
-    cmd += event.message.gsub("\n", "\\n")
+    cmd += (event["message"] || "<no message>").gsub("\n", "\\n")
 
     @logger.debug("Opening nagios command file", :commandfile => @commandfile,
                   :nagios_command => cmd)

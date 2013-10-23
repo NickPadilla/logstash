@@ -1,11 +1,11 @@
 require "logstash/outputs/base"
 require "logstash/namespace"
+require "logstash/plugin_mixins/aws_config"
 
 # SNS output.
 #
 # Send events to Amazon's Simple Notification Service, a hosted pub/sub
-# framework.  It supports subscribers of type email, HTTP/S, SMS, and
-# SQS.
+# framework.  It supports subscribers of type email, HTTP/S, SMS, and SQS.
 #
 # For further documentation about the service see:
 #
@@ -13,41 +13,24 @@ require "logstash/namespace"
 #
 # This plugin looks for the following fields on events it receives:
 #
-#  "sns"          =>  If no ARN is found in the configuration file,
-#                     this will be used as the ARN to publish.
-#  "sns_subject"  =>  The subject line that should be used.  Optional.
-#                     "%{@source}" will be used if not present
-#                     (truncated at MAX_SUBJECT_SIZE_IN_CHARACTERS).
-#  "sns_message"  =>  The message that should be sent.  Optional.  The
-#                     event serialzed as JSON will be used if not
-#                     present (with @message truncated so that the
-#                     length of the JSON fits in
-#                     MAX_MESSAGE_SIZE_IN_BYTES).
+#  * sns - If no ARN is found in the configuration file, this will be used as
+#  the ARN to publish.
+#  * sns_subject - The subject line that should be used.
+#  Optional. The "%{host}" will be used if not present and truncated at
+#  MAX_SUBJECT_SIZE_IN_CHARACTERS.
+#  * sns_message - The message that should be
+#  sent. Optional. The event serialzed as JSON will be used if not present and
+#  with the @message truncated so that the length of the JSON fits in
+#  MAX_MESSAGE_SIZE_IN_BYTES.
+#
 class LogStash::Outputs::Sns < LogStash::Outputs::Base
+  include LogStash::PluginMixins::AwsConfig
+
   MAX_SUBJECT_SIZE_IN_CHARACTERS  = 100
   MAX_MESSAGE_SIZE_IN_BYTES       = 32768
 
   config_name "sns"
-  plugin_status "experimental"
-
-  # Amazon API credentials.
-  config :access_key_id, :validate => :string
-  config :secret_access_key, :validate => :string
-
-  # Path to YAML file containing a hash of AWS credentials.  This file
-  # will be loaded if `access_key_id` and `secret_access_key` aren't
-  # set.
-  #
-  # Example:
-  #
-  # The path to YAML file containing a hash of the AWS credentials for
-  # your account.  The contents of the file should look like this:
-  #
-  # ---
-  # :access_key_id: "12345"
-  # :secret_access_key: "54321"
-  #
-  config :credentials, :validate => :string
+  milestone 1
 
   # Message format.  Defaults to plain text.
   config :format, :validate => [ "json", "plain" ], :default => "plain"
@@ -64,21 +47,17 @@ class LogStash::Outputs::Sns < LogStash::Outputs::Base
   config :publish_boot_message_arn, :validate => :string
 
   public
+  def aws_service_endpoint(region)
+    return {
+        :sns_endpoint => "sns.#{region}.amazonaws.com"
+    }
+  end
+
+  public
   def register
     require "aws-sdk"
 
-    # Credentials weren't specified in the configuration.
-    unless @access_key_id && @secret_access_key
-      access_creds = YAML.load_file(@credentials)
-
-      @access_key_id      = access_creds[:access_key_id]
-      @secret_access_key  = access_creds[:secret_access_key]
-    end
-
-    @sns = AWS::SNS.new(
-      :access_key_id      => @access_key_id,
-      :secret_access_key  => @secret_access_key
-    )
+    @sns = AWS::SNS.new(aws_options_hash)
 
     # Try to publish a "Logstash booted" message to the ARN provided to
     # cause an error ASAP if the credentials are bad.
@@ -91,12 +70,12 @@ class LogStash::Outputs::Sns < LogStash::Outputs::Base
   def receive(event)
     return unless output?(event)
 
-    arn     = Array(event.fields["sns"]).first || @arn
+    arn     = Array(event["sns"]).first || @arn
 
     raise "An SNS ARN required." unless arn
 
-    message = Array(event.fields["sns_message"]).first
-    subject = Array(event.fields["sns_subject"]).first || event.source
+    message = Array(event["sns_message"]).first
+    subject = Array(event["sns_subject"]).first || event.source
 
     # Ensure message doesn't exceed the maximum size.
     if message
@@ -125,18 +104,18 @@ class LogStash::Outputs::Sns < LogStash::Outputs::Base
     # Truncate only the message if the JSON structure is too large.
     if json_size > MAX_MESSAGE_SIZE_IN_BYTES
       # TODO: Utilize `byteslice` in JRuby 1.7: http://jira.codehaus.org/browse/JRUBY-5547
-      event.message = event.message.slice(0, (event.message.bytesize - (json_size - MAX_MESSAGE_SIZE_IN_BYTES)))
+      event["message"] = event["message"].slice(0, (event["message"].bytesize - (json_size - MAX_MESSAGE_SIZE_IN_BYTES)))
     end
 
     event.to_json
   end
 
   def self.format_message(event)
-    message =  "Date: #{event.timestamp}\n"
-    message << "Source: #{event.source}\n"
-    message << "Tags: #{event.tags.join(', ')}\n"
-    message << "Fields: #{event.fields.inspect}\n"
-    message << "Message: #{event.message}"
+    message =  "Date: #{event["@timestamp"]}\n"
+    message << "Source: #{event["source"]}\n"
+    message << "Tags: #{event["tags"].join(', ')}\n"
+    message << "Fields: #{event.to_hash.inspect}\n"
+    message << "Message: #{event["message"]}"
 
     # TODO: Utilize `byteslice` in JRuby 1.7: http://jira.codehaus.org/browse/JRUBY-5547
     message.slice(0, MAX_MESSAGE_SIZE_IN_BYTES)

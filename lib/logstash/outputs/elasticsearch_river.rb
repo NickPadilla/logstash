@@ -5,8 +5,8 @@ require "uri"
 require "net/http"
 
 # This output lets you store logs in elasticsearch. It's similar to the
-# 'elasticsearch' output but improves performance by using an AMQP server,
-# such as rabbitmq, to send data to elasticsearch.
+# 'elasticsearch' output but improves performance by using a queue server,
+# rabbitmq, to send data to elasticsearch.
 #
 # Upon startup, this output will automatically contact an elasticsearch cluster
 # and configure it to read from the queue to which we write.
@@ -17,7 +17,7 @@ require "net/http"
 class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
 
   config_name "elasticsearch_river"
-  plugin_status "beta"
+  milestone 2
 
   config :debug, :validate => :boolean, :default => false
 
@@ -28,7 +28,7 @@ class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
 
   # The index type to write events to. Generally you should try to write only
   # similar events to the same 'type'. String expansion '%{foo}' works here.
-  config :index_type, :validate => :string, :default => "%{@type}"
+  config :index_type, :validate => :string, :default => "%{type}"
 
   # The name/address of an ElasticSearch host to use for river creation
   config :es_host, :validate => :string, :required => true
@@ -41,43 +41,51 @@ class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
 
   # ElasticSearch river configuration: bulk timeout in milliseconds
   config :es_bulk_timeout_ms, :validate => :number, :default => 100
+  
+  # ElasticSearch river configuration: is ordered?
+  config :es_ordered, :validate => :boolean, :default => false
 
-  # Hostname of AMQP server
-  config :amqp_host, :validate => :string, :required => true
+  # Hostname of RabbitMQ server
+  config :rabbitmq_host, :validate => :string, :required => true
 
-  # Port of AMQP server
-  config :amqp_port, :validate => :number, :default => 5672
+  # Port of RabbitMQ server
+  config :rabbitmq_port, :validate => :number, :default => 5672
 
-  # AMQP user
+  # RabbitMQ user
   config :user, :validate => :string, :default => "guest"
 
-  # AMQP password
+  # RabbitMQ password
   config :password, :validate => :string, :default => "guest"
 
-  # AMQP vhost
+  # RabbitMQ vhost
   config :vhost, :validate => :string, :default => "/"
 
-  # AMQP queue name
-  config :name, :validate => :string, :default => "elasticsearch"
-
-  # AMQP exchange name
+  # RabbitMQ queue name
+  config :queue, :validate => :string, :default => "elasticsearch"
+  
+  # RabbitMQ exchange name
   config :exchange, :validate => :string, :default => "elasticsearch"
 
   # The exchange type (fanout, topic, direct)
   config :exchange_type, :validate => [ "fanout", "direct", "topic"],
          :default => "direct"
 
-  # AMQP routing key
+  # RabbitMQ routing key
   config :key, :validate => :string, :default => "elasticsearch"
 
-  # AMQP durability setting. Also used for ElasticSearch setting
+  # RabbitMQ durability setting. Also used for ElasticSearch setting
   config :durable, :validate => :boolean, :default => true
 
-  # AMQP persistence setting
+  # RabbitMQ persistence setting
   config :persistent, :validate => :boolean, :default => true
+
+  # The document ID for the index. Useful for overwriting existing entries in
+  # elasticsearch with the same ID.
+  config :document_id, :validate => :string, :default => nil
 
   public
   def register
+
     # TODO(sissel): find a better way of declaring where the elasticsearch
     # libraries are
     # TODO(sissel): can skip this step if we're running from a jar.
@@ -90,24 +98,23 @@ class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
 
   protected
   def prepare_river
-    require "logstash/outputs/amqp"
+    require "logstash/outputs/rabbitmq"
 
     # Configure the message plugin
     params = {
-      "host" => [@amqp_host],
-      "port" => [@amqp_port],
+      "host" => [@rabbitmq_host],
+      "port" => [@rabbitmq_port],
       "user" => [@user],
       "password" => [@password],
       "exchange_type" => [@exchange_type],
-      "queue_name" => [@name],
-      "name" => [@exchange],
+      "exchange" => [@exchange],
       "key" => [@key],
       "vhost" => [@vhost],
       "durable" => [@durable.to_s],
       "persistent" => [@persistent.to_s],
       "debug" => [@debug.to_s],
     }.reject {|k,v| v.first.nil?}
-    @mq = LogStash::Outputs::Amqp.new(params)
+    @mq = LogStash::Outputs::RabbitMQ.new(params)
     @mq.register
 
     # Set up the river
@@ -117,24 +124,30 @@ class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
       # Name the river by our hostname
       require "socket"
       hostname = Socket.gethostname
-      api_path = "/_river/logstash-#{hostname.gsub('.','_')}/_meta"
+      
+      # Replace spaces with hyphens and remove all non-alpha non-dash non-underscore characters
+      river_name = "#{hostname} #{@queue}".gsub(' ', '-').gsub(/[^\w-]/, '')
+      
+      api_path = "/_river/logstash-#{river_name}/_meta"
+      @status_path = "/_river/logstash-#{river_name}/_status"
 
       river_config = {"type" => "rabbitmq",
                       "rabbitmq" => {
-                                "host" => @amqp_host=="localhost" ? hostname : @amqp_host,
-                                "port" => @amqp_port,
+                                "host" => @rabbitmq_host=="localhost" ? hostname : @rabbitmq_host,
+                                "port" => @rabbitmq_port,
                                 "user" => @user,
                                 "pass" => @password,
                                 "vhost" => @vhost,
-                                "queue" => @name,
+                                "queue" => @queue,
                                 "exchange" => @exchange,
                                 "routing_key" => @key,
                                 "exchange_type" => @exchange_type,
                                 "exchange_durable" => @durable.to_s,
-                                "queue_durable" => @durable.to_s,
+                                "queue_durable" => @durable.to_s
                                },
                       "index" => {"bulk_size" => @es_bulk_size,
                                  "bulk_timeout" => "#{@es_bulk_timeout_ms}ms",
+                                 "ordered" => @es_ordered
                                 },
                      }
       @logger.info("ElasticSearch using river", :config => river_config)
@@ -151,25 +164,50 @@ class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
       # registration?
       @logger.warn("Couldn't set up river. You'll have to set it up manually (or restart)", :exception => e)
     end
+
+    check_river_status
   end # def prepare_river
+
+  private
+  def check_river_status
+    tries = 0
+    success = false
+    reason = nil
+    begin
+      while !success && tries <= 3 do
+        tries += 1
+        Net::HTTP.start(@es_host, @es_port) do |http|
+          req = Net::HTTP::Get.new(@status_path)
+          response = http.request(req)
+          response.value
+          status = JSON.parse(response.body)
+          @logger.debug("Checking ES river status", :status => status)
+          if status["_source"]["error"]
+            reason = "ES river status: #{status["_source"]["error"]}"
+          else
+            success = true
+          end
+        end
+        sleep(2)
+      end
+    rescue Exception => e
+      raise "river is not running, checking status failed: #{$!}"
+    end
+
+    raise "river is not running: #{reason}" unless success
+  end # def check_river_status
 
   public
   def receive(event)
     return unless output?(event)
-
-    # TODO(sissel): Refactor this to not use so much string concatonation.
-
     # River events have a format of
     # "action\ndata\n"
     # where 'action' is index or delete, data is the data to index.
-    index_message = {
-      "index" => { 
-        "_index" => event.sprintf(@index),
-        "_type" => event.sprintf(@index_type)
-      }
-   }.to_json + "\n"
+    header = { "index" => { "_index" => event.sprintf(@index), "_type" => event.sprintf(@index_type) } }
+    if !@document_id.nil?
+      header["index"]["_id"] = event.sprintf(@document_id)
+    end
 
-    index_message += event.to_json + "\n"
-    @mq.receive_raw(index_message)
+    @mq.publish_serialized(header.to_json + "\n" + event.to_json + "\n")
   end # def receive
 end # LogStash::Outputs::ElasticSearchRiver
